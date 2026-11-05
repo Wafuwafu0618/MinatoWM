@@ -1,0 +1,30 @@
+[package]
+name = "minato"
+description = "MinatoWM: a single-binary tiling window manager for Windows"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "minato"
+path = "src/main.rs"
+
+[dependencies]
+minato-config = { workspace = true }
+minato-wm = { workspace = true }
+minato-ui = { workspace = true }
+gpui-kit = { workspace = true }
+anyhow = { workspace = true }
+log = { workspace = true }
+crossbeam-channel = { workspace = true }
+arc-swap = { workspace = true }
+tray-icon = "0.26"
+
+[dependencies.windows-sys]
+workspace = true
+features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+]

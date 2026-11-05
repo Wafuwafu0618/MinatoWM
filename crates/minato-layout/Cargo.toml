@@ -1,0 +1,9 @@
+[package]
+name = "minato-layout"
+description = "Pure tiling layout calculations for MinatoWM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }

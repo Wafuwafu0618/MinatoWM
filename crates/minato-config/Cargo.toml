@@ -1,0 +1,19 @@
+[package]
+name = "minato-config"
+description = "Configuration schema, persistence and hot reload for MinatoWM"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+minato-layout = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+regex = { workspace = true }
+dirs = { workspace = true }
+notify = { workspace = true }
+log = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
