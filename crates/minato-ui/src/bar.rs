@@ -165,15 +165,18 @@ impl BarView {
         if !Arc::ptr_eq(&snap, &self.snapshot) {
             self.snapshot = snap;
             dirty = true;
-            let fullscreen = self.monitor_snapshot().is_some_and(|m| m.fullscreen);
-            if fullscreen != self.hidden {
-                self.hidden = fullscreen;
-                if let Some(h) = self.hwnd {
-                    if fullscreen {
-                        h.hide();
-                    } else {
-                        h.show();
-                    }
+        }
+        // Maximizing doesn't reach the WM (it skips location-change events),
+        // so this is checked on every tick rather than per snapshot.
+        let hide = self.monitor_snapshot().is_some_and(|m| m.fullscreen) || self.maximized_here();
+        if hide != self.hidden {
+            self.hidden = hide;
+            if let Some(h) = self.hwnd {
+                if hide {
+                    h.hide();
+                } else {
+                    h.show();
+                    dirty = true;
                 }
             }
         }
@@ -198,6 +201,18 @@ impl BarView {
         if dirty && !self.hidden {
             cx.notify();
         }
+    }
+
+    /// A maximized window on this monitor would have its top edge under
+    /// the bar: the foreground window, or any window of the shown workspace.
+    fn maximized_here(&self) -> bool {
+        let shown = |h: Hwnd| h.is_maximized() && h.is_visible() && !h.is_cloaked() && h.monitor() == self.monitor;
+        if Hwnd::foreground().is_some_and(shown) {
+            return true;
+        }
+        self.monitor_snapshot()
+            .and_then(|m| m.workspaces.get(m.active_workspace))
+            .is_some_and(|ws| ws.windows.iter().any(|w| shown(Hwnd(w.hwnd))))
     }
 
     fn monitor_index(&self) -> Option<usize> {
