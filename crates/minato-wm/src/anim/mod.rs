@@ -41,6 +41,12 @@ const FREEZE_ACK_TIMEOUT: Duration = Duration::from_millis(150);
 const DEFAULT_BORDER: Color = Color::rgb(0x5a, 0x5a, 0x5a);
 /// Cached workspace pictures kept on the GPU (a 4K picture is ~37 MB).
 const CACHE_ENTRIES: usize = 6;
+/// The most an animation advances per frame (two frames at 60 Hz).
+const MAX_FRAME_STEP: Duration = Duration::from_millis(34);
+/// How long the overlay stays up after the last animation.
+const OVERLAY_LINGER: Duration = Duration::from_secs(2);
+/// Crossfade from a slid-in picture to the live windows.
+const SETTLE_FADE: Duration = Duration::from_millis(90);
 
 /// Identifies a cached picture: (monitor handle, workspace index).
 pub type CacheKey = (isize, usize);
@@ -177,21 +183,79 @@ impl Animator {
 
 enum State {
     Frozen { since: Instant },
-    /// `v0`: starting velocity (progress per second) for physical springs.
-    Playing { start: Instant, play: Play, v0: f32 },
+    /// `clock` is the animation's own time: it advances by at most
+    /// [`MAX_FRAME_STEP`] per frame, so a dropped frame delays the motion
+    /// instead of making it jump.
+    Playing { clock: Duration, last: Instant, anim: Anim },
 }
 
+enum Anim {
+    /// Hold the pictures, then fade them out.
+    Fade {
+        hold: Duration,
+        duration: Duration,
+        curve: Easing,
+    },
+    /// Move the strip from shift `from` to `to`. `v0`: starting velocity
+    /// (progress per second) for physical springs.
+    Slide {
+        from: (f32, f32),
+        to: (f32, f32),
+        duration: Duration,
+        curve: Easing,
+        v0: f32,
+    },
+}
+
+/// One picture of the strip, at `base` when the strip is not shifted.
+struct Tile {
+    layer: Layer,
+    base: (f32, f32),
+    /// The workspace it shows, if it is a whole picture of one.
+    ws: Option<CacheKey>,
+}
+
+/// What covers one monitor: a strip of workspace pictures that slides as a
+/// whole. A switch during a slide extends the strip instead of capturing
+/// the half-finished picture, so every workspace stays one intact picture
+/// and the motion simply continues.
 struct Scene {
     group: Group,
     area: Rect,
-    out: Layer,
-    incoming: Option<Layer>,
+    tiles: Vec<Tile>,
+    /// Current offset of the whole strip.
+    shift: (f32, f32),
+    /// Strip position of the workspace being shown (or slid to).
+    cursor: (f32, f32),
+    /// Strip velocity in pixels per second, carried into the next slide.
+    velocity: (f32, f32),
+    /// Crossfading from the slid-in picture to the live windows.
+    settling: bool,
     state: State,
-    /// Direction and velocity of the slide currently playing.
-    motion: Option<((i32, i32), f32)>,
-    /// Motion of the slide this scene interrupted, handed to its own slide
-    /// so rapid switches keep their momentum.
-    carry: Option<((i32, i32), f32)>,
+}
+
+impl Scene {
+    fn place(&self) {
+        place(&self.tiles, self.shift);
+    }
+
+    fn sliding(&self) -> bool {
+        matches!(self.state, State::Playing { anim: Anim::Slide { .. }, .. })
+    }
+
+    /// Whether the strip has a picture where the workspace at `cursor` is.
+    fn covers_cursor(&self) -> bool {
+        let (w, h) = (self.area.w as f32, self.area.h as f32);
+        self.tiles
+            .iter()
+            .any(|t| (t.base.0 - self.cursor.0).abs() < w && (t.base.1 - self.cursor.1).abs() < h)
+    }
+}
+
+fn place(tiles: &[Tile], shift: (f32, f32)) {
+    for t in tiles {
+        t.layer.set_offset(t.base.0 + shift.0, t.base.1 + shift.1);
+    }
 }
 
 struct BorderFade {
@@ -242,12 +306,22 @@ impl Engine {
     }
 
     fn run(mut self, rx: Receiver<Msg>) {
+        let mut last_busy = Instant::now();
         loop {
             let busy = !self.scenes.is_empty() || !self.borders.is_empty();
-            if !busy {
-                self.comp.hide();
+            if busy {
+                last_busy = Instant::now();
+            } else {
+                // Keep the (empty, click-through) overlay up for a while:
+                // a freshly shown window can take an extra frame to appear,
+                // which the next freeze would otherwise have to wait out.
+                let linger = OVERLAY_LINGER.saturating_sub(last_busy.elapsed());
+                if linger.is_zero() {
+                    self.comp.hide();
+                }
+                let wait = if self.comp.shown() { linger } else { Duration::from_millis(250) };
                 // Idle: wait for work, servicing the overlay window meanwhile.
-                match rx.recv_timeout(Duration::from_millis(250)) {
+                match rx.recv_timeout(wait.max(Duration::from_millis(1))) {
                     Ok(msg) => self.handle(msg),
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                         self.comp.pump();
@@ -277,39 +351,7 @@ impl Engine {
                 let ok = self.freeze(key, area, cache_as);
                 let _ = ack.send(ok);
             }
-            Msg::Play { key, play } => {
-                let Some(scene) = self.scenes.get_mut(&key) else {
-                    return;
-                };
-                if !matches!(scene.state, State::Frozen { .. }) {
-                    // Already released by the timeout.
-                    return;
-                }
-                if let Play::Slide { incoming: Some(ck), dir, .. } = &play {
-                    if let Some((surface, w, h)) = self.cache.get(ck) {
-                        if *w == scene.area.w && *h == scene.area.h {
-                            match self.comp.layer_from_surface(&scene.group, surface.clone()) {
-                                Ok(layer) => {
-                                    layer.set_offset((dir.0 * w) as f32, (dir.1 * h) as f32);
-                                    scene.incoming = Some(layer);
-                                }
-                                Err(e) => log::warn!("incoming layer failed: {e}"),
-                            }
-                        }
-                    }
-                }
-                // Continue an interrupted slide: same direction keeps the speed,
-                // the opposite direction starts out moving backwards.
-                let v0 = match (&play, scene.carry) {
-                    (Play::Slide { dir, .. }, Some((old, vel))) => vel * (old.0 * dir.0 + old.1 * dir.1) as f32,
-                    _ => 0.0,
-                };
-                scene.state = State::Playing {
-                    start: Instant::now(),
-                    play,
-                    v0,
-                };
-            }
+            Msg::Play { key, play } => self.play(key, play),
             Msg::Invalidate(ck) => {
                 self.cache.remove(&ck);
                 self.cache_order.retain(|k| *k != ck);
@@ -347,8 +389,110 @@ impl Engine {
         }
     }
 
+    fn play(&mut self, key: isize, play: Play) {
+        let Some(scene) = self.scenes.get_mut(&key) else {
+            return;
+        };
+        if !matches!(scene.state, State::Frozen { .. }) {
+            // Already released by the timeout, or a layout change that
+            // arrived mid-slide (the slide keeps going).
+            return;
+        }
+        let anim = match play {
+            Play::Fade { hold, duration, curve } => {
+                scene.velocity = (0.0, 0.0);
+                Anim::Fade { hold, duration, curve }
+            }
+            Play::Slide {
+                incoming,
+                dir,
+                duration,
+                curve,
+            } => {
+                let (w, h) = (scene.area.w as f32, scene.area.h as f32);
+                let target = (scene.cursor.0 + dir.0 as f32 * w, scene.cursor.1 + dir.1 as f32 * h);
+                let near = |b: (f32, f32)| (b.0 - target.0).abs() < 0.5 && (b.1 - target.1).abs() < 0.5;
+                // Going back to a workspace still in the strip: reuse it.
+                let reuse = incoming.is_some() && scene.tiles.iter().any(|t| t.ws == incoming && near(t.base));
+                if !reuse {
+                    // Whatever sits in the target's spot shows something else.
+                    let comp = &self.comp;
+                    let group = &scene.group;
+                    scene.tiles.retain(|t| {
+                        let overlaps = (t.base.0 - target.0).abs() < w && (t.base.1 - target.1).abs() < h;
+                        if overlaps {
+                            comp.remove_layer(group, &t.layer);
+                        }
+                        !overlaps
+                    });
+                    if let Some(ck) = incoming {
+                        if let Some((surface, cw, chh)) = self.cache.get(&ck) {
+                            if *cw == scene.area.w && *chh == scene.area.h {
+                                match self.comp.layer_from_surface(&scene.group, surface.clone()) {
+                                    Ok(layer) => scene.tiles.push(Tile {
+                                        layer,
+                                        base: target,
+                                        ws: Some(ck),
+                                    }),
+                                    Err(e) => log::warn!("incoming layer failed: {e}"),
+                                }
+                            }
+                        }
+                    }
+                }
+                let from = scene.shift;
+                let to = (-target.0, -target.1);
+                let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+                let dist = (dx * dx + dy * dy).sqrt();
+                // Keep the momentum of an interrupted slide (negative if it
+                // was heading the other way).
+                let v0 = if dist > 1.0 {
+                    (scene.velocity.0 * dx + scene.velocity.1 * dy) / (dist * dist)
+                } else {
+                    0.0
+                };
+                scene.cursor = target;
+                scene.place();
+                Anim::Slide {
+                    from,
+                    to,
+                    duration,
+                    curve,
+                    v0,
+                }
+            }
+        };
+        scene.state = State::Playing {
+            clock: Duration::ZERO,
+            last: Instant::now(),
+            anim,
+        };
+    }
+
+    /// Captures `sub` (relative to `area`) of the screen as a layer of `group`.
+    fn capture_layer(&mut self, group: &Group, area: Rect, sub: Rect) -> Option<Layer> {
+        let abs = Rect::new(area.x + sub.x, area.y + sub.y, sub.w, sub.h);
+        // GPU path first (never contains the cursor); GDI if this area isn't
+        // duplicable.
+        let layer = match self.dup.capture(&self.comp.ctx, abs) {
+            Some((tex, x, y)) => self
+                .comp
+                .layer_from_texture(group, &tex, x, y, abs.w as u32, abs.h as u32),
+            None => self.comp.layer(group, &capture::capture(abs)?),
+        };
+        layer.map_err(|e| log::warn!("capture failed: {e}")).ok()
+    }
+
     fn freeze(&mut self, key: isize, area: Rect, cache_as: Option<CacheKey>) -> bool {
         let started = Instant::now();
+        if self.scenes.get(&key).is_some_and(|s| s.sliding() && s.area == area) {
+            if cache_as.is_some() {
+                self.interrupt_slide(key);
+            }
+            // A layout change mid-slide is simply covered by the slide.
+            log::debug!("continued slide in {:?}", started.elapsed());
+            return true;
+        }
         let group = match self.comp.group(area) {
             Ok(g) => g,
             Err(e) => {
@@ -356,66 +500,90 @@ impl Engine {
                 return false;
             }
         };
-        // GPU path first (never contains the cursor); GDI if this area isn't
-        // duplicable.
-        let captured = self.dup.capture(&self.comp.ctx, area);
-        let frame = if captured.is_none() { capture::capture(area) } else { None };
-        let layer = match captured {
-            Some((tex, x, y)) => self
-                .comp
-                .layer_from_texture(&group, &tex, x, y, area.w as u32, area.h as u32),
-            None => match frame {
-                Some(frame) => self.comp.layer(&group, &frame),
-                None => {
-                    self.comp.remove_group(&group);
-                    return false;
-                }
-            },
+        let Some(out) = self.capture_layer(&group, area, Rect::new(0, 0, area.w, area.h)) else {
+            self.comp.remove_group(&group);
+            return false;
         };
-        let out = match layer {
-            Ok(l) => l,
-            Err(e) => {
-                log::warn!("freeze failed: {e}");
-                self.comp.remove_group(&group);
-                return false;
-            }
-        };
-        if let Some(ck) = cache_as {
-            self.cache.insert(ck, (out.surface.clone(), area.w, area.h));
-            self.cache_order.retain(|k| *k != ck);
-            self.cache_order.push(ck);
-            while self.cache_order.len() > CACHE_ENTRIES {
-                let oldest = self.cache_order.remove(0);
-                self.cache.remove(&oldest);
-            }
-        }
         // The new picture already shows any half-finished animation (the
         // overlay is part of the captured desktop), so the old scene can
-        // simply be replaced.
-        let mut carry = None;
-        if let Some(old) = self.scenes.remove(&key) {
-            carry = old.motion;
+        // simply be replaced. Mid layout-fade that picture is an old layout,
+        // though: not something to slide back to later.
+        let old = self.scenes.remove(&key);
+        let trustworthy = old.as_ref().is_none_or(|s| s.settling);
+        if let Some(old) = &old {
             self.comp.remove_group(&old.group);
+        }
+        if let Some(ck) = cache_as {
+            self.cache.remove(&ck);
+            self.cache_order.retain(|k| *k != ck);
+            if trustworthy {
+                self.cache.insert(ck, (out.surface.clone(), area.w, area.h));
+                self.cache_order.push(ck);
+                while self.cache_order.len() > CACHE_ENTRIES {
+                    let oldest = self.cache_order.remove(0);
+                    self.cache.remove(&oldest);
+                }
+            }
         }
         self.scenes.insert(
             key,
             Scene {
                 group,
                 area,
-                out,
-                incoming: None,
+                tiles: vec![Tile {
+                    layer: out,
+                    base: (0.0, 0.0),
+                    ws: cache_as,
+                }],
+                shift: (0.0, 0.0),
+                cursor: (0.0, 0.0),
+                velocity: (0.0, 0.0),
+                settling: false,
                 state: State::Frozen { since: Instant::now() },
-                motion: None,
-                carry,
             },
         );
-        self.comp.show();
+        let fresh = self.comp.show();
         self.comp.commit();
         unsafe {
             let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            if fresh {
+                // A window that just appeared may miss the first composition.
+                let _ = windows::Win32::Graphics::Dwm::DwmFlush();
+            }
         }
         log::debug!("froze {}x{} in {:?}", area.w, area.h, started.elapsed());
         true
+    }
+
+    /// Stops the strip where it is until the next `play` continues it. If
+    /// the workspace being slid in had no picture, the live windows were
+    /// showing through; they are captured now, before the WM hides them.
+    fn interrupt_slide(&mut self, key: isize) {
+        let Some(scene) = self.scenes.get(&key) else {
+            return;
+        };
+        let area = scene.area;
+        let gap = (!scene.covers_cursor())
+            .then(|| {
+                let x0 = (scene.cursor.0 + scene.shift.0).round() as i32;
+                let y0 = (scene.cursor.1 + scene.shift.1).round() as i32;
+                let (l, t) = (x0.max(0), y0.max(0));
+                let (r, b) = ((x0 + area.w).min(area.w), (y0 + area.h).min(area.h));
+                (r > l && b > t).then(|| Rect::new(l, t, r - l, b - t))
+            })
+            .flatten();
+        if let Some(sub) = gap {
+            let group = scene.group.clone();
+            if let Some(layer) = self.capture_layer(&group, area, sub) {
+                let scene = self.scenes.get_mut(&key).unwrap();
+                let base = (sub.x as f32 - scene.shift.0, sub.y as f32 - scene.shift.1);
+                layer.set_offset(sub.x as f32, sub.y as f32);
+                scene.tiles.push(Tile { layer, base, ws: None });
+            }
+        }
+        let scene = self.scenes.get_mut(&key).unwrap();
+        scene.state = State::Frozen { since: Instant::now() };
+        self.comp.commit();
     }
 
     /// Advances every animation by one frame and drops finished ones.
@@ -425,41 +593,68 @@ impl Engine {
         for (key, scene) in self.scenes.iter_mut() {
             if let State::Frozen { since } = scene.state {
                 if now - since > FREEZE_TIMEOUT {
+                    scene.velocity = (0.0, 0.0);
                     scene.state = State::Playing {
-                        start: now,
-                        play: Play::Fade {
+                        clock: Duration::ZERO,
+                        last: now,
+                        anim: Anim::Fade {
                             hold: Duration::ZERO,
                             duration: Duration::from_millis(150),
                             curve: Easing::LINEAR,
                         },
-                        v0: 0.0,
                     };
                 }
             }
-            let State::Playing { start, play, v0 } = &scene.state else {
+            let State::Playing { clock, last, anim } = &mut scene.state else {
                 continue;
             };
-            let elapsed = now - *start;
-            let finished = match play {
-                Play::Fade { hold, duration, curve } => {
-                    let s = curve.sample(elapsed.saturating_sub(*hold).as_secs_f32(), duration.as_secs_f32(), 0.0);
-                    scene.out.set_opacity(1.0 - s.value);
-                    elapsed >= *hold && s.done
-                }
-                Play::Slide { dir, duration, curve, .. } => {
-                    let s = curve.sample(elapsed.as_secs_f32(), duration.as_secs_f32(), *v0);
-                    let p = s.value;
-                    scene.motion = Some((*dir, s.velocity));
-                    let (w, h) = (scene.area.w as f32, scene.area.h as f32);
-                    let (dx, dy) = (dir.0 as f32, dir.1 as f32);
-                    scene.out.set_offset(-dx * w * p, -dy * h * p);
-                    if let Some(inc) = &scene.incoming {
-                        inc.set_offset(dx * w * (1.0 - p), dy * h * (1.0 - p));
+            *clock += now.saturating_duration_since(*last).min(MAX_FRAME_STEP);
+            *last = now;
+            let t = *clock;
+            let mut slid_in = false;
+            let finished = match anim {
+                Anim::Fade { hold, duration, curve } => {
+                    let s = curve.sample(t.saturating_sub(*hold).as_secs_f32(), duration.as_secs_f32(), 0.0);
+                    for tile in &scene.tiles {
+                        tile.layer.set_opacity(1.0 - s.value);
                     }
-                    s.done
+                    t >= *hold && s.done
+                }
+                Anim::Slide {
+                    from,
+                    to,
+                    duration,
+                    curve,
+                    v0,
+                } => {
+                    let s = curve.sample(t.as_secs_f32(), duration.as_secs_f32(), *v0);
+                    let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+                    scene.shift = (from.0 + dx * s.value, from.1 + dy * s.value);
+                    scene.velocity = (dx * s.velocity, dy * s.velocity);
+                    place(&scene.tiles, scene.shift);
+                    slid_in = s.done;
+                    false
                 }
             };
-            if finished {
+            if slid_in {
+                if scene.covers_cursor() {
+                    // The picture may be a little out of date: crossfade to
+                    // the live windows instead of swapping in one frame.
+                    scene.velocity = (0.0, 0.0);
+                    scene.settling = true;
+                    scene.state = State::Playing {
+                        clock: Duration::ZERO,
+                        last: now,
+                        anim: Anim::Fade {
+                            hold: Duration::ZERO,
+                            duration: SETTLE_FADE,
+                            curve: Easing::LINEAR,
+                        },
+                    };
+                } else {
+                    done.push(*key);
+                }
+            } else if finished {
                 done.push(*key);
             }
         }

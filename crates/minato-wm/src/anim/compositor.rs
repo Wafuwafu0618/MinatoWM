@@ -74,6 +74,7 @@ impl Layer {
 }
 
 /// A monitor-sized container that clips its layers to the monitor.
+#[derive(Clone)]
 pub struct Group {
     visual: IDCompositionVisual,
 }
@@ -177,9 +178,11 @@ impl Compositor {
         }
     }
 
-    pub fn show(&mut self) {
+    /// Returns `true` if the overlay was hidden until now.
+    pub fn show(&mut self) -> bool {
         self.fit();
-        if !self.shown {
+        let fresh = !self.shown;
+        if fresh {
             self.shown = true;
             unsafe {
                 let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
@@ -187,6 +190,11 @@ impl Compositor {
                 let _ = SetWindowPos(self.hwnd, Some(HWND_TOPMOST), b.x, b.y, b.w, b.h, SWP_NOACTIVATE);
             }
         }
+        fresh
+    }
+
+    pub fn shown(&self) -> bool {
+        self.shown
     }
 
     pub fn hide(&mut self) {
@@ -230,6 +238,12 @@ impl Compositor {
     pub fn remove_group(&self, group: &Group) {
         unsafe {
             let _ = self.root.RemoveVisual(&group.visual);
+        }
+    }
+
+    pub fn remove_layer(&self, group: &Group, layer: &Layer) {
+        unsafe {
+            let _ = group.visual.RemoveVisual(&layer.visual);
         }
     }
 
