@@ -60,4 +60,4 @@ cargo build -p minato --release
 
 ## ライセンス
 
-MIT License
+[MIT License](LICENSE)

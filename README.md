@@ -62,4 +62,4 @@ Keybindings can be changed in the settings window.
 
 ## License
 
-MIT License
+[MIT License](LICENSE)
