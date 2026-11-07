@@ -1,59 +1,65 @@
 # MinatoWM
 
-Windows 向けのタイル型ウィンドウマネージャです。GUI の設定画面を備えており、設定ファイルを直接編集せずにキーバインドやレイアウトを調整できます。
+English | [日本語](README.ja.md)
 
-## 特徴
+![MinatoWM](docs/image/image.png)
 
-- **8 種類のレイアウト** — BSP / Columns / Rows / Vertical Stack / Right-Main Vertical Stack / Horizontal Stack / Ultrawide Vertical Stack / Grid
-- **ウィンドウスタック** — 複数のウィンドウを 1 つのタイルに重ねてタブのように切り替え可能
-- **ワークスペース** — 最大 9 つの仮想ワークスペースとモニタごとのステータスバー
-- **アニメーション** — ウィンドウの移動・リサイズやワークスペース切り替え時のスムーズなアニメーション
-- **GUI 設定画面** — トレイアイコンやショートカットからいつでも開け、変更は即座に反映
+A tiling window manager for Windows. It comes with a GUI settings window, so you can adjust keybindings and layouts without editing configuration files by hand.
 
-## 動作環境
+## Features
 
-- Windows 10 / 11（ウィンドウのフォーカス枠表示は Windows 11 のみ対応）
+- **8 layouts** — BSP / Columns / Rows / Vertical Stack / Right-Main Vertical Stack / Horizontal Stack / Ultrawide Vertical Stack / Grid
+- **Window stacks** — Stack multiple windows in a single tile and switch between them like tabs
+- **Workspaces** — Up to 9 virtual workspaces, with a status bar on each monitor
+- **Animations** — Smooth animations for moving and resizing windows and for switching workspaces
+- **GUI settings** — Open it anytime from the tray icon or a shortcut; changes take effect immediately
 
-## ビルドと実行
+## Requirements
 
-ビルドには [Rust](https://www.rust-lang.org/) ツールチェーンが必要です。
+- Windows 10 / 11 (the window focus border is only available on Windows 11)
+
+> **Note:** The user interface (settings window and tray menu) is currently available in Japanese only.
+
+## Build and Run
+
+Building requires the [Rust](https://www.rust-lang.org/) toolchain.
 
 ```powershell
 cargo build -p minato --release
 ```
 
-生成された `target/release/minato.exe` を実行するとタスクトレイに常駐し、自動でウィンドウのタイル配置が始まります。初回起動時は設定画面が表示されます。
+Run the generated `target/release/minato.exe`. It stays in the system tray and starts tiling windows automatically. The settings window opens on first launch.
 
-## 使い方
+## Usage
 
-- **設定を開く**: トレイアイコンをクリックするか、`Alt+Shift+O` を押します。
-- **一時停止**: `Alt+Shift+P` またはトレイメニューから、タイル配置を一時停止できます。
-- **終了**: トレイメニューの「終了」を選択します。終了時には別ワークスペースのウィンドウもすべて元の状態に復帰します。
+- **Open settings**: Click the tray icon or press `Alt+Shift+O`.
+- **Pause**: Pause tiling with `Alt+Shift+P` or from the tray menu.
+- **Quit**: Select "終了" (Quit) from the tray menu. On exit, all windows, including those on other workspaces, are restored to their original state.
 
-### デフォルトのキーバインド
+### Default Keybindings
 
-キーバインドは設定画面から変更できます。
+Keybindings can be changed in the settings window.
 
-| キー | 動作 |
+| Key | Action |
 |---|---|
-| `Alt + H / J / K / L` | フォーカス移動（左 / 下 / 上 / 右、画面端では隣接モニタへ） |
-| `Alt + Shift + H / J / K / L` | ウィンドウの入れ替え / 隣接モニタへの移動 |
-| `Alt + Ctrl + H / J / K / L` | その方向の辺を広げる（`+ Shift` で縮める） |
-| `Alt + 矢印キー` | 隣のタイルにウィンドウをスタック |
-| `Alt + ;` | スタック解除 |
-| `Alt + [` / `Alt + ]` | スタック内のウィンドウを切り替え |
-| `Alt + Enter` | メインエリアに昇格 |
-| `Alt + Space` | レイアウトを切り替え |
-| `Alt + X` / `Alt + Y` | レイアウトの左右反転 / 上下反転 |
-| `Alt + T` | フローティング表示の切り替え |
-| `Alt + F` | モノクル（最大化）表示の切り替え |
-| `Alt + 1..9` | ワークスペースを切り替え |
-| `Alt + Shift + 1..9` | ウィンドウを指定ワークスペースへ移動 |
-| `Alt + Q` | ウィンドウを閉じる |
-| `Alt + Shift + R` | 再タイル |
-| `Alt + Shift + O` | 設定画面を開く |
-| `Alt + Shift + P` | 一時停止 / 再開 |
+| `Alt + H / J / K / L` | Move focus (left / down / up / right; moves to the adjacent monitor at the screen edge) |
+| `Alt + Shift + H / J / K / L` | Swap windows / move to the adjacent monitor |
+| `Alt + Ctrl + H / J / K / L` | Grow the edge in that direction (`+ Shift` to shrink) |
+| `Alt + Arrow keys` | Stack the window onto the neighboring tile |
+| `Alt + ;` | Unstack |
+| `Alt + [` / `Alt + ]` | Cycle through windows in the stack |
+| `Alt + Enter` | Promote to the main area |
+| `Alt + Space` | Cycle layouts |
+| `Alt + X` / `Alt + Y` | Flip the layout horizontally / vertically |
+| `Alt + T` | Toggle floating |
+| `Alt + F` | Toggle monocle (maximized) mode |
+| `Alt + 1..9` | Switch workspace |
+| `Alt + Shift + 1..9` | Move the window to the specified workspace |
+| `Alt + Q` | Close the window |
+| `Alt + Shift + R` | Retile |
+| `Alt + Shift + O` | Open settings |
+| `Alt + Shift + P` | Pause / resume |
 
-## ライセンス
+## License
 
 MIT License
