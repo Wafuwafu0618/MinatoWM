@@ -13,7 +13,7 @@ use minato_layout::{neighbor, Arrangement, Direction, LayoutKind, LayoutParams, 
 
 use crate::anim::curve::Easing;
 use crate::anim::{Animator, Play};
-use crate::hidden;
+use crate::{hidden, perf};
 use crate::hotkey::{self, Keymap};
 use crate::snapshot::{ForegroundSnapshot, MonitorSnapshot, Snapshot, WindowSnapshot, WorkspaceSnapshot};
 use crate::state::{Container, Monitor, Ring, Slot, Workspace};
@@ -104,6 +104,12 @@ pub struct WindowManager {
     /// A window being closed by `Action::Close`, for the close fade.
     closing: Option<(usize, Hwnd, Instant)>,
     last_layout_freeze: HashMap<usize, Instant>,
+    /// Executable name and class of each window in the snapshot. Neither
+    /// changes during a window's life, and querying the executable means
+    /// opening its process: too slow to repeat for every window each batch.
+    identities: HashMap<Hwnd, (String, String)>,
+    /// Control-pipe requests to answer once the current batch is done.
+    pub(crate) control_replies: Vec<crossbeam_channel::Sender<Option<crate::perf::BatchPerf>>>,
 }
 
 fn make_workspaces(cfg: &Config, monitor: usize) -> Ring<Workspace> {
@@ -156,6 +162,8 @@ impl WindowManager {
             applied: HashMap::new(),
             closing: None,
             last_layout_freeze: HashMap::new(),
+            identities: HashMap::new(),
+            control_replies: Vec::new(),
         };
         wm.config_errors = wm.apply_keymap(&cfg);
         wm.config_errors.extend(cfg.validate());
@@ -196,6 +204,23 @@ impl WindowManager {
             WmMsg::Config(cfg) => self.apply_config(cfg),
             WmMsg::ConfigError(e) => {
                 self.config_errors = vec![e];
+            }
+            WmMsg::Control { op, reply } => {
+                match op {
+                    crate::ControlOp::Ping => {}
+                    // Quitting is not something to do remotely.
+                    crate::ControlOp::Action(action) => {
+                        if action != Action::Quit && (!self.paused || action == Action::TogglePause) {
+                            self.on_action(action);
+                        }
+                    }
+                    crate::ControlOp::FocusWorkspaceOn { monitor, workspace } => {
+                        if !self.paused && monitor < self.monitors.len() {
+                            self.focus_workspace(monitor, workspace);
+                        }
+                    }
+                }
+                self.control_replies.push(reply);
             }
         }
     }
@@ -318,19 +343,22 @@ impl WindowManager {
     fn hide(&mut self, hwnd: Hwnd) {
         if self.hidden.insert(hwnd) {
             self.hidden_dirty = true;
+            perf::time(perf::Op::Hide, || hwnd.hide());
+        } else if hwnd.is_visible() {
+            // Hidden by us before, but the app showed itself again.
+            perf::time(perf::Op::Hide, || hwnd.hide());
         }
-        hwnd.hide();
     }
 
     fn show(&mut self, hwnd: Hwnd) {
         if self.hidden.remove(&hwnd) {
             self.hidden_dirty = true;
-            hwnd.show();
+            perf::time(perf::Op::Show, || hwnd.show());
         }
     }
 
     fn focus_window(&mut self, hwnd: Hwnd) {
-        hwnd.focus();
+        perf::time(perf::Op::Focus, || hwnd.focus());
         if self.cfg.mouse_follows_focus {
             if let Some(r) = hwnd.frame_rect() {
                 let (x, y) = r.center();
@@ -405,6 +433,12 @@ impl WindowManager {
     /// Lays out the active workspace of monitor `mi`: positions and shows
     /// its visible windows, hides background stack members.
     fn retile(&mut self, mi: usize) {
+        // Safety net for windows whose destruction we missed: a dead
+        // handle would keep an empty tile.
+        let dead: Vec<Hwnd> = self.ws(mi).windows().filter(|h| !h.exists()).collect();
+        for h in dead {
+            self.unmanage(h);
+        }
         let area = self.layout_area(mi);
         let params = self.layout_params(self.ws(mi));
         let ws = self.ws_mut(mi);
@@ -443,7 +477,7 @@ impl WindowManager {
 
         for (h, r) in place {
             self.show(h);
-            h.set_position(r);
+            perf::time(perf::Op::SetPosition, || h.set_position(r));
             self.applied.insert(h, r);
         }
         for h in floating {
@@ -483,7 +517,11 @@ impl WindowManager {
                 }
             }
             WinEvent::Destroy => {
-                if !hwnd.exists() {
+                // The event can arrive while the handle is still valid. A
+                // window being destroyed is no longer visible, though; and
+                // one we hid (background workspace) never sends the Hide
+                // that would otherwise have unmanaged it.
+                if !hwnd.exists() || !hwnd.is_visible() {
                     if let Some(mi) = self.unmanage(hwnd) {
                         self.retile(mi);
                     }
@@ -703,7 +741,7 @@ impl WindowManager {
         self.switch_workspace(mi, wi);
         self.monitors.focus(mi);
         self.focus_active(mi);
-        win32::nudge_cursor();
+        perf::time(perf::Op::Focus, win32::nudge_cursor);
     }
 
     /// Focuses the focused window of monitor `mi`'s active workspace, or the
@@ -1198,12 +1236,21 @@ impl WindowManager {
     /// [`Self::after_batch`].
     fn freeze(&mut self, mi: usize, kind: Freeze) {
         if let Some(existing) = self.frozen.get_mut(&mi) {
-            // Already frozen this batch: the picture predates every change.
-            // A workspace switch wins over a plain layout change.
-            if matches!(kind, Freeze::Workspace { .. }) {
-                *existing = kind;
+            match (*existing, kind) {
+                // A second switch in the same batch: the first one may
+                // already be sliding (early play), so continue from there
+                // like a switch mid-slide.
+                (Freeze::Workspace { .. }, Freeze::Workspace { .. }) => {
+                    self.frozen.remove(&mi);
+                }
+                // Already frozen this batch: the picture predates every
+                // change. A workspace switch wins over a layout change.
+                (_, Freeze::Workspace { .. }) => {
+                    *existing = kind;
+                    return;
+                }
+                _ => return,
             }
-            return;
         }
         if !self.animations_on() {
             return;
@@ -1235,8 +1282,17 @@ impl WindowManager {
             Freeze::Layout => None,
         };
         let area = usable_area(&self.cfg, &info);
-        if self.anim.freeze(info.handle, area, cache_as) {
+        let waited = Instant::now();
+        let frozen = self.anim.freeze(info.handle, area, cache_as);
+        perf::freeze_waited(waited.elapsed());
+        if frozen {
             self.frozen.insert(mi, kind);
+            // A slide to a workspace whose picture is cached can start
+            // now: until it ends only pictures are visible, so the window
+            // shuffling below doesn't have to finish first.
+            if let Some(play) = self.play_for(kind, info.handle, true) {
+                self.anim.play(info.handle, play);
+            }
         }
     }
 
@@ -1261,35 +1317,45 @@ impl WindowManager {
                 continue;
             };
             let key = m.info.handle;
-            let a = &self.cfg.animations;
-            let ms = |v: u32| Duration::from_millis(v as u64);
-            let play = match kind {
-                Freeze::Layout => Play::Fade {
-                    hold: ms(a.layout.hold_ms),
-                    duration: ms(a.layout.duration_ms),
-                    curve: Easing::from_spec(a.curve(&a.layout.curve)),
-                },
-                Freeze::Workspace { from, to } => {
-                    let curve = Easing::from_spec(a.curve(&a.workspace.curve));
-                    let duration = ms(a.workspace.duration_ms);
-                    let sign = if to > from { 1 } else { -1 };
-                    match a.workspace.style {
-                        WorkspaceStyle::Fade => Play::Fade {
-                            hold: ms(a.layout.hold_ms),
-                            duration,
-                            curve,
-                        },
-                        style => Play::Slide {
-                            incoming: Some((key, to)),
-                            dir: if style == WorkspaceStyle::SlideVertical { (0, sign) } else { (sign, 0) },
-                            duration,
-                            curve,
-                        },
-                    }
-                }
-            };
-            self.anim.play(key, play);
+            if let Some(play) = self.play_for(kind, key, false) {
+                self.anim.play(key, play);
+            }
         }
+    }
+
+    /// The animation that releases a freeze of `kind` on monitor `key`.
+    /// `early`: for before the windows have moved, which only a slide can
+    /// start with (see `Play::Slide::only_if_cached`).
+    fn play_for(&self, kind: Freeze, key: isize, early: bool) -> Option<Play> {
+        let a = &self.cfg.animations;
+        let ms = |v: u32| Duration::from_millis(v as u64);
+        let play = match kind {
+            Freeze::Layout => Play::Fade {
+                hold: ms(a.layout.hold_ms),
+                duration: ms(a.layout.duration_ms),
+                curve: Easing::from_spec(a.curve(&a.layout.curve)),
+            },
+            Freeze::Workspace { from, to } => {
+                let curve = Easing::from_spec(a.curve(&a.workspace.curve));
+                let duration = ms(a.workspace.duration_ms);
+                let sign = if to > from { 1 } else { -1 };
+                match a.workspace.style {
+                    WorkspaceStyle::Fade => Play::Fade {
+                        hold: ms(a.layout.hold_ms),
+                        duration,
+                        curve,
+                    },
+                    style => Play::Slide {
+                        incoming: Some((key, to)),
+                        dir: if style == WorkspaceStyle::SlideVertical { (0, sign) } else { (sign, 0) },
+                        duration,
+                        curve,
+                        only_if_cached: early,
+                    },
+                }
+            }
+        };
+        (!early || matches!(play, Play::Slide { .. })).then_some(play)
     }
 
     /// Forgets the picture of a background workspace whose contents changed.
@@ -1299,9 +1365,23 @@ impl WindowManager {
         }
     }
 
-    fn publish_snapshot(&self) {
+    /// Publishes the state for the UI, unless nothing changed: every new
+    /// snapshot makes the status bars redraw.
+    fn publish_snapshot(&mut self) {
         let fg = Hwnd::foreground();
-        let monitors = self
+        let mut identities = std::mem::take(&mut self.identities);
+        let mut seen = HashSet::new();
+        let mut identity = |h: Hwnd| {
+            seen.insert(h);
+            identities
+                .entry(h)
+                .or_insert_with(|| {
+                    let info = h.info();
+                    (info.exe, info.class)
+                })
+                .clone()
+        };
+        let monitors: Vec<MonitorSnapshot> = self
             .monitors
             .iter()
             .enumerate()
@@ -1328,12 +1408,12 @@ impl WindowManager {
                         windows: w
                             .windows()
                             .map(|h| {
-                                let info = h.info();
+                                let (exe, class) = identity(h);
                                 WindowSnapshot {
                                     hwnd: h.0,
-                                    title: info.title,
-                                    exe: info.exe,
-                                    class: info.class,
+                                    title: h.title(),
+                                    exe,
+                                    class,
                                     floating: matches!(w.find(h), Some(Slot::Floating(_))),
                                     focused: Some(h) == fg,
                                 }
@@ -1343,19 +1423,23 @@ impl WindowManager {
                     .collect(),
             })
             .collect();
-        self.snapshot.store(Arc::new(Snapshot {
+        let foreground = fg.map(|h| ForegroundSnapshot {
+            monitor: h.monitor(),
+            title: h.title(),
+            exe: identity(h).0,
+        });
+        identities.retain(|h, _| seen.contains(h));
+        crate::anim::set_warm_up_allowed(!monitors.iter().any(|m| m.fullscreen));
+        self.identities = identities;
+        let snapshot = Snapshot {
             paused: self.paused,
             config_errors: self.config_errors.clone(),
             monitors,
-            foreground: fg.map(|h| {
-                let info = h.info();
-                ForegroundSnapshot {
-                    monitor: h.monitor(),
-                    title: info.title,
-                    exe: info.exe,
-                }
-            }),
-        }));
+            foreground,
+        };
+        if **self.snapshot.load() != snapshot {
+            self.snapshot.store(Arc::new(snapshot));
+        }
     }
 }
 

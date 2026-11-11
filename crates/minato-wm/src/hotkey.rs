@@ -83,6 +83,11 @@ const KEY_NAMES: &[(&str, u16)] = &[
     ("pause", 0x13),
 ];
 
+/// Alt (VK_MENU, VK_LMENU, VK_RMENU) and Win (VK_LWIN, VK_RWIN).
+fn is_warm_up_vk(vk: u16) -> bool {
+    matches!(vk, 0x12 | 0xA4 | 0xA5 | 0x5B | 0x5C)
+}
+
 fn is_modifier_vk(vk: u16) -> bool {
     matches!(vk, 0x10..=0x12 | 0x5B | 0x5C | 0xA0..=0xA5)
 }
@@ -299,6 +304,12 @@ unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -
             let info = &*(lparam as *const KBDLLHOOKSTRUCT);
             let vk = info.vkCode as u16;
             let injected = info.flags & LLKHF_INJECTED != 0;
+            let down = matches!(wparam as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            if !injected && down && is_warm_up_vk(vk) && !state.paused.load(Ordering::Relaxed) {
+                // Alt/Win usually start a WM hotkey: get the animation
+                // overlay ready while the rest of the chord is typed.
+                crate::anim::warm_up();
+            }
             if !injected && !is_modifier_vk(vk) {
                 let msg = wparam as u32;
                 let swallow = match msg {

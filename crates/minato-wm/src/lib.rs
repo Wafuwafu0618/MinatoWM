@@ -8,6 +8,7 @@
 pub mod anim;
 mod hidden;
 pub mod hotkey;
+pub mod perf;
 mod snapshot;
 mod state;
 pub mod win32;
@@ -16,6 +17,7 @@ mod wm;
 
 use std::sync::Arc;
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 use arc_swap::ArcSwap;
 use crossbeam_channel::Sender;
@@ -33,6 +35,33 @@ pub enum WmMsg {
     Config(Arc<Config>),
     /// The config file changed but could not be parsed.
     ConfigError(String),
+    /// From the control pipe: run `op`, then reply with the timing of the
+    /// batch it ran in once that batch is fully done.
+    Control {
+        op: ControlOp,
+        reply: Sender<Option<perf::BatchPerf>>,
+    },
+}
+
+/// What a control-pipe request asks the WM thread to do.
+#[derive(Debug, Clone)]
+pub enum ControlOp {
+    Ping,
+    Action(Action),
+    FocusWorkspaceOn { monitor: usize, workspace: usize },
+}
+
+impl WmMsg {
+    fn describe(&self) -> String {
+        match self {
+            WmMsg::Event(ev, _) => format!("event:{ev:?}"),
+            WmMsg::Action(a) => format!("action:{a:?}"),
+            WmMsg::FocusWorkspaceOn { workspace, .. } => format!("bar:workspace {workspace}"),
+            WmMsg::Config(_) => "config".into(),
+            WmMsg::ConfigError(_) => "config_error".into(),
+            WmMsg::Control { op, .. } => format!("control:{op:?}"),
+        }
+    }
 }
 
 /// Requests from the WM to the application shell.
@@ -94,18 +123,29 @@ pub fn start(cfg: Config, on_ui: impl Fn(UiRequest) + Send + 'static) -> anyhow:
         let mut wm = wm::WindowManager::new(cfg, snap, Box::new(on_ui), animator);
         wm.init();
         'outer: while let Ok(msg) = rx.recv() {
+            let started = Instant::now();
+            perf::batch_begin(|| msg.describe());
+            perf::batch_message();
             wm.handle(msg);
             // Coalesce bursts (e.g. an app opening several windows).
             while !wm.quit {
                 match rx.try_recv() {
-                    Ok(msg) => wm.handle(msg),
+                    Ok(msg) => {
+                        perf::batch_message();
+                        wm.handle(msg);
+                    }
                     Err(_) => break,
                 }
             }
             if wm.quit {
                 break 'outer;
             }
+            let after = Instant::now();
             wm.after_batch();
+            let record = perf::batch_end(started.elapsed(), after.elapsed());
+            for reply in wm.control_replies.drain(..) {
+                let _ = reply.send(record.clone());
+            }
         }
         wm.shutdown();
         wm.notify_quit();

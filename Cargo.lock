@@ -4018,7 +4018,22 @@ dependencies = [
  "minato-config",
  "minato-ui",
  "minato-wm",
+ "serde",
+ "serde_json",
  "tray-icon",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "minato-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "minato-config",
+ "minato-layout",
+ "minato-wm",
+ "serde",
+ "serde_json",
  "windows-sys 0.61.2",
 ]
 

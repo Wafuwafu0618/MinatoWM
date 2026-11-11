@@ -1,0 +1,14 @@
+{
+  "name": "slow_apps (paint 30ms, move 15ms)",
+  "workspaces": [7, 8],
+  "steps": [
+    { "op": "delay", "paint_ms": 30, "size_ms": 15 },
+    { "op": "workspace", "index": 7 },
+    { "op": "open", "count": 4, "label": "open" },
+    { "op": "workspace", "index": 8 },
+    { "op": "open", "count": 4 },
+    { "op": "cycle", "label": "switch", "repeat": 12, "interval_ms": 900,
+      "workspaces": [7, 8] },
+    { "op": "close", "count": 4, "label": "close" }
+  ]
+}

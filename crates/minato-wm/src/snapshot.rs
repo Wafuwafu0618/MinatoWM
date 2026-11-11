@@ -1,8 +1,9 @@
 //! Read-only view of the WM state, published for the settings UI.
 
 use minato_layout::{LayoutKind, Rect};
+use serde::Serialize;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct Snapshot {
     pub paused: bool,
     /// Problems found in the current config (bad regex, unknown keys, ...).
@@ -12,7 +13,7 @@ pub struct Snapshot {
     pub foreground: Option<ForegroundSnapshot>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ForegroundSnapshot {
     /// `HMONITOR` of the monitor the window is on.
     pub monitor: isize,
@@ -20,7 +21,7 @@ pub struct ForegroundSnapshot {
     pub exe: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct MonitorSnapshot {
     /// `HMONITOR`.
     pub handle: isize,
@@ -38,7 +39,7 @@ pub struct MonitorSnapshot {
     pub workspaces: Vec<WorkspaceSnapshot>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorkspaceSnapshot {
     pub name: String,
     pub layout: LayoutKind,
@@ -46,7 +47,7 @@ pub struct WorkspaceSnapshot {
     pub windows: Vec<WindowSnapshot>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WindowSnapshot {
     pub hwnd: isize,
     pub title: String,

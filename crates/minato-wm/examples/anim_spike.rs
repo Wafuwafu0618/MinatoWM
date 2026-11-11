@@ -84,6 +84,7 @@ fn main() {
             dir: (1, 0),
             duration: Duration::from_millis(800),
             curve: Easing::LINEAR,
+            only_if_cached: false,
         },
     );
     std::thread::sleep(Duration::from_millis(400));
@@ -110,6 +111,7 @@ fn main() {
             dir: (1, 0),
             duration: Duration::from_millis(450),
             curve: Easing::Spring { damping: 1.0 },
+            only_if_cached: false,
         },
     );
     std::thread::sleep(Duration::from_millis(900));

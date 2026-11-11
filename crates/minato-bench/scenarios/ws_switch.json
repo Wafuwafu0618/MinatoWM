@@ -1,0 +1,14 @@
+{
+  "name": "ws_switch",
+  "workspaces": [7, 8],
+  "steps": [
+    { "op": "workspace", "index": 7 },
+    { "op": "open", "count": 4 },
+    { "op": "workspace", "index": 8 },
+    { "op": "open", "count": 4 },
+    { "op": "cycle", "label": "switch", "repeat": 20, "interval_ms": 900,
+      "workspaces": [7, 8] },
+    { "op": "cycle", "label": "switch_rapid", "repeat": 20, "interval_ms": 100, "wait": false,
+      "workspaces": [7, 8] }
+  ]
+}

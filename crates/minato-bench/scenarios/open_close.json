@@ -1,0 +1,9 @@
+{
+  "name": "open_close",
+  "workspaces": [7],
+  "steps": [
+    { "op": "workspace", "index": 7 },
+    { "op": "open", "count": 6, "label": "open" },
+    { "op": "close", "count": 6, "label": "close" }
+  ]
+}

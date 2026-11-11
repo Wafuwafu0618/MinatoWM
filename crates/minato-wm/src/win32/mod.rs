@@ -34,7 +34,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     GetWindowLongPtrW,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
     IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SetCursorPos, SetForegroundWindow,
-    SetWindowPos, ShowWindow, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SWP_ASYNCWINDOWPOS,
+    SetWindowPos, ShowWindow, ShowWindowAsync, GWL_EXSTYLE, GWL_STYLE, GW_OWNER, SWP_ASYNCWINDOWPOS,
     SWP_NOACTIVATE, SWP_NOOWNERZORDER, SWP_NOZORDER, SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE,
     WM_CLOSE, WS_CAPTION, WS_CHILD, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT,
     WS_THICKFRAME,
@@ -296,12 +296,17 @@ impl Hwnd {
         }
     }
 
+    /// Hides the window without waiting for its app. A plain `ShowWindow`
+    /// on another process's window blocks until that app's UI thread has
+    /// handled the change, so one slow app would stall every workspace
+    /// switch (very noticeable on weaker CPUs).
     pub fn hide(self) {
-        unsafe { ShowWindow(self.raw(), SW_HIDE) };
+        unsafe { ShowWindowAsync(self.raw(), SW_HIDE) };
     }
 
+    /// Shows the window without activating it or waiting for its app.
     pub fn show(self) {
-        unsafe { ShowWindow(self.raw(), SW_SHOWNOACTIVATE) };
+        unsafe { ShowWindowAsync(self.raw(), SW_SHOWNOACTIVATE) };
     }
 
     /// Politely asks the window to close, like clicking its X button.

@@ -19,6 +19,8 @@ mod diagnose;
 pub use diagnose::cursor_report;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
@@ -31,6 +33,7 @@ use compositor::{Compositor, Group, Layer};
 use curve::Easing;
 use duplication::Duplicator;
 
+use crate::perf::{self, FrameStats, FreezePerf};
 use crate::win32::Hwnd;
 
 /// A frozen picture that never gets a `play` is released after this long.
@@ -67,6 +70,11 @@ pub enum Play {
         dir: (i32, i32),
         duration: Duration,
         curve: Easing,
+        /// Sent before the WM has moved any windows: only start if the
+        /// incoming workspace has a picture, since otherwise the live
+        /// windows show through and must be in place first. (The WM sends
+        /// the play again, without this, once it is done.)
+        only_if_cached: bool,
     },
 }
 
@@ -83,6 +91,9 @@ enum Msg {
     },
     Invalidate(CacheKey),
     ClearCache,
+    /// A hotkey may be coming: put the (empty) overlay on screen now, so
+    /// the freeze doesn't have to wait for it to appear.
+    WarmUp,
     Border {
         hwnd: Hwnd,
         from: Option<Color>,
@@ -90,6 +101,26 @@ enum Msg {
         duration: Duration,
         curve: Easing,
     },
+}
+
+/// For [`warm_up`], which is called from the keyboard hook thread.
+static WARM_TX: OnceLock<Sender<Msg>> = OnceLock::new();
+/// Cleared while a full-screen app is in front: showing the overlay then
+/// could disturb it, and nothing animates there anyway.
+static WARM_ALLOWED: AtomicBool = AtomicBool::new(true);
+
+/// Prepares the overlay for an animation that is probably about to start
+/// (a WM modifier key went down). Cheap; safe from any thread.
+pub fn warm_up() {
+    if WARM_ALLOWED.load(Ordering::Relaxed) {
+        if let Some(tx) = WARM_TX.get() {
+            let _ = tx.send(Msg::WarmUp);
+        }
+    }
+}
+
+pub fn set_warm_up_allowed(allowed: bool) {
+    WARM_ALLOWED.store(allowed, Ordering::Relaxed);
 }
 
 /// Handle to the animation thread. Cheap to clone; all methods are no-ops
@@ -118,6 +149,9 @@ impl Animator {
             Engine::new(compositor).run(rx);
         });
         let ok = spawned.is_ok() && ready_rx.recv_timeout(Duration::from_secs(5)).unwrap_or(false);
+        if ok {
+            let _ = WARM_TX.set(tx.clone());
+        }
         Self { tx: ok.then_some(tx) }
     }
 
@@ -232,6 +266,8 @@ struct Scene {
     /// Crossfading from the slid-in picture to the live windows.
     settling: bool,
     state: State,
+    /// Frame timing of the running animation (only when perf is enabled).
+    stats: Option<FrameStats>,
 }
 
 impl Scene {
@@ -281,6 +317,26 @@ struct Engine {
     /// Pictures of background workspaces with the size they were taken at.
     cache: HashMap<CacheKey, (IDCompositionSurface, i32, i32)>,
     cache_order: Vec<CacheKey>,
+    /// One display refresh period, for counting slow frames.
+    refresh: Duration,
+    /// Last time something was animating (or about to), for the linger.
+    last_busy: Instant,
+}
+
+/// The compositor's refresh period (16.7ms if it can't be queried).
+fn refresh_period() -> Duration {
+    use windows::Win32::Graphics::Dwm::{DwmGetCompositionTimingInfo, DWM_TIMING_INFO};
+    let mut info = DWM_TIMING_INFO {
+        cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
+        ..Default::default()
+    };
+    let ok = unsafe { DwmGetCompositionTimingInfo(windows::Win32::Foundation::HWND::default(), &mut info) }.is_ok();
+    let (n, d) = (info.rateRefresh.uiNumerator, info.rateRefresh.uiDenominator);
+    if ok && n > 0 && d > 0 {
+        Duration::from_secs_f64(d as f64 / n as f64)
+    } else {
+        Duration::from_micros(16_667)
+    }
 }
 
 /// Shows or hides the system cursor for every app (Magnification API).
@@ -302,20 +358,22 @@ impl Engine {
             borders: HashMap::new(),
             cache: HashMap::new(),
             cache_order: Vec::new(),
+            refresh: refresh_period(),
+            last_busy: Instant::now(),
         }
     }
 
     fn run(mut self, rx: Receiver<Msg>) {
-        let mut last_busy = Instant::now();
         loop {
             let busy = !self.scenes.is_empty() || !self.borders.is_empty();
+            perf::set_anim_busy(busy);
             if busy {
-                last_busy = Instant::now();
+                self.last_busy = Instant::now();
             } else {
                 // Keep the (empty, click-through) overlay up for a while:
                 // a freshly shown window can take an extra frame to appear,
                 // which the next freeze would otherwise have to wait out.
-                let linger = OVERLAY_LINGER.saturating_sub(last_busy.elapsed());
+                let linger = OVERLAY_LINGER.saturating_sub(self.last_busy.elapsed());
                 if linger.is_zero() {
                     self.comp.hide();
                 }
@@ -346,6 +404,11 @@ impl Engine {
     }
 
     fn handle(&mut self, msg: Msg) {
+        self.handle_inner(msg);
+        perf::set_anim_busy(!self.scenes.is_empty() || !self.borders.is_empty());
+    }
+
+    fn handle_inner(&mut self, msg: Msg) {
         match msg {
             Msg::Freeze { key, area, cache_as, ack } => {
                 let ok = self.freeze(key, area, cache_as);
@@ -359,6 +422,13 @@ impl Engine {
             Msg::ClearCache => {
                 self.cache.clear();
                 self.cache_order.clear();
+            }
+            Msg::WarmUp => {
+                self.last_busy = Instant::now();
+                if !self.comp.shown() {
+                    self.comp.show();
+                    self.comp.commit();
+                }
             }
             Msg::Border {
                 hwnd,
@@ -408,12 +478,20 @@ impl Engine {
                 dir,
                 duration,
                 curve,
+                only_if_cached,
             } => {
                 let (w, h) = (scene.area.w as f32, scene.area.h as f32);
                 let target = (scene.cursor.0 + dir.0 as f32 * w, scene.cursor.1 + dir.1 as f32 * h);
                 let near = |b: (f32, f32)| (b.0 - target.0).abs() < 0.5 && (b.1 - target.1).abs() < 0.5;
                 // Going back to a workspace still in the strip: reuse it.
                 let reuse = incoming.is_some() && scene.tiles.iter().any(|t| t.ws == incoming && near(t.base));
+                let cached = incoming
+                    .and_then(|ck| self.cache.get(&ck))
+                    .is_some_and(|(_, cw, chh)| *cw == scene.area.w && *chh == scene.area.h);
+                if only_if_cached && !reuse && !cached {
+                    // Wait for the WM's second play, after its windows moved.
+                    return;
+                }
                 if !reuse {
                     // Whatever sits in the target's spot shows something else.
                     let comp = &self.comp;
@@ -462,6 +540,13 @@ impl Engine {
                 }
             }
         };
+        if perf::enabled() {
+            let kind = if matches!(anim, Anim::Slide { .. }) { "slide" } else { "fade" };
+            // A slide continued from an interrupted one keeps its stats.
+            if scene.stats.is_none() || kind == "fade" {
+                scene.stats = Some(FrameStats::new(kind, self.refresh));
+            }
+        }
         scene.state = State::Playing {
             clock: Duration::ZERO,
             last: Instant::now(),
@@ -470,17 +555,19 @@ impl Engine {
     }
 
     /// Captures `sub` (relative to `area`) of the screen as a layer of `group`.
-    fn capture_layer(&mut self, group: &Group, area: Rect, sub: Rect) -> Option<Layer> {
+    fn capture_layer(&mut self, group: &Group, area: Rect, sub: Rect) -> Option<(Layer, &'static str)> {
         let abs = Rect::new(area.x + sub.x, area.y + sub.y, sub.w, sub.h);
         // GPU path first (never contains the cursor); GDI if this area isn't
         // duplicable.
-        let layer = match self.dup.capture(&self.comp.ctx, abs) {
-            Some((tex, x, y)) => self
-                .comp
-                .layer_from_texture(group, &tex, x, y, abs.w as u32, abs.h as u32),
-            None => self.comp.layer(group, &capture::capture(abs)?),
+        let (layer, kind) = match self.dup.capture(&self.comp.ctx, abs) {
+            Some((tex, x, y)) => (
+                self.comp
+                    .layer_from_texture(group, &tex, x, y, abs.w as u32, abs.h as u32),
+                "dup",
+            ),
+            None => (self.comp.layer(group, &capture::capture(abs)?), "gdi"),
         };
-        layer.map_err(|e| log::warn!("capture failed: {e}")).ok()
+        layer.map(|l| (l, kind)).map_err(|e| log::warn!("capture failed: {e}")).ok()
     }
 
     fn freeze(&mut self, key: isize, area: Rect, cache_as: Option<CacheKey>) -> bool {
@@ -491,6 +578,13 @@ impl Engine {
             }
             // A layout change mid-slide is simply covered by the slide.
             log::debug!("continued slide in {:?}", started.elapsed());
+            perf::record_freeze(FreezePerf {
+                total_ms: started.elapsed().as_secs_f64() * 1000.0,
+                capture: "none",
+                w: area.w,
+                h: area.h,
+                ..Default::default()
+            });
             return true;
         }
         let group = match self.comp.group(area) {
@@ -500,10 +594,11 @@ impl Engine {
                 return false;
             }
         };
-        let Some(out) = self.capture_layer(&group, area, Rect::new(0, 0, area.w, area.h)) else {
+        let Some((out, capture_kind)) = self.capture_layer(&group, area, Rect::new(0, 0, area.w, area.h)) else {
             self.comp.remove_group(&group);
             return false;
         };
+        let captured = started.elapsed();
         // The new picture already shows any half-finished animation (the
         // overlay is part of the captured desktop), so the old scene can
         // simply be replaced. Mid layout-fade that picture is an old layout,
@@ -540,10 +635,13 @@ impl Engine {
                 velocity: (0.0, 0.0),
                 settling: false,
                 state: State::Frozen { since: Instant::now() },
+                stats: None,
             },
         );
         let fresh = self.comp.show();
+        let before_commit = started.elapsed();
         self.comp.commit();
+        let committed = started.elapsed();
         unsafe {
             let _ = windows::Win32::Graphics::Dwm::DwmFlush();
             if fresh {
@@ -551,7 +649,19 @@ impl Engine {
                 let _ = windows::Win32::Graphics::Dwm::DwmFlush();
             }
         }
-        log::debug!("froze {}x{} in {:?}", area.w, area.h, started.elapsed());
+        let total = started.elapsed();
+        log::debug!("froze {}x{} in {:?}", area.w, area.h, total);
+        let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+        perf::record_freeze(FreezePerf {
+            total_ms: ms(total),
+            capture: capture_kind,
+            capture_ms: ms(captured),
+            commit_ms: ms(committed - before_commit),
+            flush_ms: ms(total - committed),
+            fresh,
+            w: area.w,
+            h: area.h,
+        });
         true
     }
 
@@ -574,7 +684,7 @@ impl Engine {
             .flatten();
         if let Some(sub) = gap {
             let group = scene.group.clone();
-            if let Some(layer) = self.capture_layer(&group, area, sub) {
+            if let Some((layer, _)) = self.capture_layer(&group, area, sub) {
                 let scene = self.scenes.get_mut(&key).unwrap();
                 let base = (sub.x as f32 - scene.shift.0, sub.y as f32 - scene.shift.1);
                 layer.set_offset(sub.x as f32, sub.y as f32);
@@ -593,6 +703,9 @@ impl Engine {
         for (key, scene) in self.scenes.iter_mut() {
             if let State::Frozen { since } = scene.state {
                 if now - since > FREEZE_TIMEOUT {
+                    if perf::enabled() {
+                        scene.stats = Some(FrameStats::new("timeout", self.refresh));
+                    }
                     scene.velocity = (0.0, 0.0);
                     scene.state = State::Playing {
                         clock: Duration::ZERO,
@@ -608,6 +721,9 @@ impl Engine {
             let State::Playing { clock, last, anim } = &mut scene.state else {
                 continue;
             };
+            if let Some(stats) = scene.stats.as_mut() {
+                stats.frame(now);
+            }
             *clock += now.saturating_duration_since(*last).min(MAX_FRAME_STEP);
             *last = now;
             let t = *clock;
@@ -661,6 +777,9 @@ impl Engine {
         for key in done {
             if let Some(scene) = self.scenes.remove(&key) {
                 self.comp.remove_group(&scene.group);
+                if let Some(stats) = &scene.stats {
+                    stats.finish();
+                }
             }
         }
 

@@ -38,6 +38,10 @@ impl Duplicator {
         let mut outputs = Vec::new();
         unsafe {
             if let Ok(adapter) = device.cast::<IDXGIDevice>().and_then(|d| d.GetAdapter()) {
+                if let Ok(desc) = adapter.GetDesc() {
+                    let name = String::from_utf16_lossy(&desc.Description);
+                    log::info!("overlay GPU: {}", name.trim_end_matches('\0'));
+                }
                 let mut i = 0;
                 while let Ok(output) = adapter.EnumOutputs(i) {
                     i += 1;

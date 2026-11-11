@@ -1,0 +1,14 @@
+{
+  "name": "layout_ops",
+  "workspaces": [7],
+  "steps": [
+    { "op": "workspace", "index": 7 },
+    { "op": "open", "count": 4 },
+    { "op": "cycle", "label": "cycle_layout", "repeat": 8,
+      "actions": [ { "type": "cycle_layout", "dir": "next" } ] },
+    { "op": "cycle", "label": "resize", "repeat": 10,
+      "actions": [ { "type": "resize", "dir": "right", "sizing": "increase" }, { "type": "resize", "dir": "right", "sizing": "decrease" } ] },
+    { "op": "cycle", "label": "promote", "repeat": 10,
+      "actions": [ { "type": "promote" } ] }
+  ]
+}

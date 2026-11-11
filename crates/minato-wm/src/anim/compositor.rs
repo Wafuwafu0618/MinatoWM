@@ -7,7 +7,7 @@ use minato_layout::Rect;
 use windows::core::{w, Interface, Result};
 use windows::Win32::Foundation::{HMODULE, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
+use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_UNKNOWN};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, D3D11_BOX,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_SDK_VERSION,
@@ -17,7 +17,7 @@ use windows::Win32::Graphics::DirectComposition::{
     IDCompositionTarget, IDCompositionVisual,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM};
-use windows::Win32::Graphics::Dxgi::IDXGIDevice;
+use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIAdapter, IDXGIAdapter1, IDXGIDevice, IDXGIFactory1};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DispatchMessageW, GetSystemMetrics, PeekMessageW,
@@ -48,6 +48,61 @@ fn virtual_screen() -> Rect {
             GetSystemMetrics(SM_CYVIRTUALSCREEN),
         )
     }
+}
+
+/// The adapter driving the most desktop outputs. On hybrid-graphics
+/// laptops the default adapter can be the discrete GPU while the screen
+/// hangs off the integrated one: Desktop Duplication then finds no outputs
+/// and every capture falls back to slow GDI, and every frame would have to
+/// cross between the GPUs.
+fn display_adapter() -> Option<IDXGIAdapter1> {
+    unsafe {
+        let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+        let mut best: Option<(IDXGIAdapter1, usize)> = None;
+        let mut i = 0;
+        while let Ok(adapter) = factory.EnumAdapters1(i) {
+            i += 1;
+            let mut outputs = 0;
+            let mut j = 0;
+            while let Ok(output) = adapter.EnumOutputs(j) {
+                j += 1;
+                if output.GetDesc().is_ok_and(|d| d.AttachedToDesktop.as_bool()) {
+                    outputs += 1;
+                }
+            }
+            if outputs > best.as_ref().map_or(0, |b| b.1) {
+                best = Some((adapter, outputs));
+            }
+        }
+        best.map(|b| b.0)
+    }
+}
+
+fn create_device() -> Result<(ID3D11Device, ID3D11DeviceContext)> {
+    let create = |adapter: Option<&IDXGIAdapter>| unsafe {
+        let mut d3d = None;
+        let mut ctx = None;
+        D3D11CreateDevice(
+            adapter,
+            // An explicit adapter requires the UNKNOWN driver type.
+            if adapter.is_some() { D3D_DRIVER_TYPE_UNKNOWN } else { D3D_DRIVER_TYPE_HARDWARE },
+            HMODULE::default(),
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut d3d),
+            None,
+            Some(&mut ctx),
+        )
+        .map(|()| (d3d.unwrap(), ctx.unwrap()))
+    };
+    if let Some(adapter) = display_adapter().and_then(|a| a.cast::<IDXGIAdapter>().ok()) {
+        match create(Some(&adapter)) {
+            Ok(dc) => return Ok(dc),
+            Err(e) => log::warn!("overlay device on the display adapter failed: {e}"),
+        }
+    }
+    create(None)
 }
 
 /// One image on the overlay.
@@ -131,21 +186,7 @@ impl Compositor {
             // opacity lets the DirectComposition content through.
             SetLayeredWindowAttributes(hwnd, Default::default(), 255, LWA_ALPHA)?;
 
-            let mut d3d = None;
-            let mut ctx = None;
-            D3D11CreateDevice(
-                None,
-                D3D_DRIVER_TYPE_HARDWARE,
-                HMODULE::default(),
-                D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-                None,
-                D3D11_SDK_VERSION,
-                Some(&mut d3d),
-                None,
-                Some(&mut ctx),
-            )?;
-            let d3d: ID3D11Device = d3d.unwrap();
-            let ctx: ID3D11DeviceContext = ctx.unwrap();
+            let (d3d, ctx) = create_device()?;
             let dxgi: IDXGIDevice = d3d.cast()?;
             let dcomp: IDCompositionDevice = DCompositionCreateDevice(&dxgi)?;
             let target = dcomp.CreateTargetForHwnd(hwnd, true)?;

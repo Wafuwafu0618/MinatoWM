@@ -2,6 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod autostart;
+mod control;
 mod instance;
 mod logger;
 mod tray;
@@ -76,6 +77,10 @@ fn run() -> anyhow::Result<()> {
             let _ = wm_tx.send(WmMsg::ConfigError(e));
         }
     })?;
+
+    if control::requested() {
+        control::start(wm.sender(), wm.snapshot.clone());
+    }
 
     let open_tx = app_tx.clone();
     instance::listen(move || {
