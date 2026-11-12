@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check tag matches Cargo version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}".TrimStart("v")
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          if ($tag -ne $version) {
+            Write-Error "Tag v$tag does not match workspace version $version in Cargo.toml"
+            exit 1
+          }
+
+      - name: Build
+        run: cargo build -p minato --release --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "minato-${{ github.ref_name }}-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Path dist/$name | Out-Null
+          Copy-Item target/release/minato.exe, README.md, README.ja.md, LICENSE dist/$name/
+          Compress-Archive -Path dist/$name -DestinationPath dist/$name.zip
+          "ASSET=dist/$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" "${{ env.ASSET }}" --title "${{ github.ref_name }}" --generate-notes
